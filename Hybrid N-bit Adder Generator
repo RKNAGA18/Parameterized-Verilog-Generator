@@ -172,7 +172,7 @@ module mux_2to1_wide (d0, d1, sel, y);
     
     genvar i;
     generate
-        for (i = ind 0; i < WIDTH; i = i + 1) begin : mux_bit
+        for (i = 0; i < WIDTH; i = i + 1) begin : mux_bit
             wire n_sel, y0, y1;
             not u_not (n_sel, sel);
             and u_and0 (y0, d0[i], n_sel);
@@ -288,7 +288,7 @@ module ${module_name}_tb;
     wire         cout;
 
     wire [N:0] expected_sum;
-    assign expected_sum = {1'b0, a} + {1'b0, b} + {N{1'b0}, cin};
+    assign expected_sum = {1'b0, a} + {1'b0, b} + cin;
 
     wire error;
     assign error = (expected_sum != {cout, sum});
@@ -332,7 +332,7 @@ module ${module_name}_tb;
                 \$display("!!! ERROR @ time %0t !!!", \$time);
                 \$display("    Inputs:  a=%h, b=%h, cin=%b", a, b, cin);
                 \$display("    DUT:     {cout,sum} = %h", {cout, sum});
-                \$display("    Expected: {cout,sum} = %s", expected_sum);
+                \$display("    Expected: {cout,sum} = %h", expected_sum);
                 error_count = error_count + 1;
                 if (error_count > 10) begin
                     \$display("!!! Too many errors. Aborting test. !!!");
@@ -345,7 +345,7 @@ module ${module_name}_tb;
             \$display("--- TEST PASSED: All %0d random tests successful! ---", NUM_TESTS);
         end else begin
             \$display("--- TEST FAILED: %0d errors found out of %0d tests. ---", error_count, NUM_TESTS);
-        }
+        end
         \$finish;
     end
 
