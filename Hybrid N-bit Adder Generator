@@ -1,1 +1,358 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use File::Basename;
+use POSIX 'floor'; 
 
+sub main {
+    my %opts;
+
+    print "--- Perl Hybrid Adder Generator (Verilog-2001) ---\n";
+
+    while (1) {
+        print "Enter total bits (N): ";
+        $opts{n} = <STDIN>;
+        chomp($opts{n});
+        if ($opts{n} && $opts{n} =~ /^\d+$/ && $opts{n} > 0) {
+            last; 
+        }
+        print "Invalid input. Please enter a positive number.\n";
+    }
+    my $n_bits = $opts{n};
+
+    my $default_k = floor($n_bits / 2);
+    while (1) {
+        print "Enter LSB bits for CSLA (K) [default: $default_k]: ";
+        $opts{k} = <STDIN>;
+        chomp($opts{k});
+        
+        if ($opts{k} eq "") {
+            $opts{k} = $default_k;
+            print "--- Info: Using default K = $opts{k}\n";
+            last;
+        } elsif ($opts{k} =~ /^\d+$/) {
+            if ($opts{k} >= $n_bits) {
+                print "Error: K ($opts{k}) must be less than N ($n_bits).\n";
+            } elsif ($opts{k} == 0) {
+                 print "Error: K must be greater than 0.\n";
+            } else {
+                last; 
+            }
+        } else {
+            print "Invalid input. Please enter a number or press Enter for default.\n";
+        }
+    }
+    my $k_bits = $opts{k};
+    my $msb_bits = $n_bits - $k_bits;
+
+    while (1) {
+        print "Enter output file name (e.g., hybrid_adder.v): ";
+        $opts{out_file} = <STDIN>;
+        chomp($opts{out_file});
+        if ($opts{out_file}) {
+            last; 
+        }
+        print "Invalid input. Please enter a file name.\n";
+    }
+
+    while (1) {
+        print "Enter top module name (e.g., hybrid32_12): ";
+        $opts{name} = <STDIN>;
+        chomp($opts{name});
+        if ($opts{name}) {
+            if ($opts{name} =~ /^[a-zA-Z_][a-zA-Z0-9_\$]*$/) {
+                 last; 
+            } else {
+                print "Invalid Verilog module name. Use letters, numbers, _, \$ (start with letter or _).\n";
+            }
+        } else {
+            print "Invalid input. Please enter a module name.\n";
+        }
+    }
+    
+    print "\n--- Generating Hybrid Adder: N=$n_bits, K=$k_bits ---\n";
+    generate_design_and_tb(\%opts);
+    print "--- Generation complete. ---\n";
+}
+
+sub generate_design_and_tb {
+    my ($opts_ref) = @_;
+    
+    my $n_bits      = $opts_ref->{n};
+    my $k_bits      = $opts_ref->{k};
+    my $out_file    = $opts_ref->{out_file};
+    my $module_name = $opts_ref->{name};
+    my $msb_bits    = $n_bits - $k_bits;
+
+    print "Generating Verilog module '$module_name' in file '$out_file'...\n";
+    open(my $fh, '>', $out_file) or die "Could not open file '$out_file': $!";
+    
+    print $fh "`timescale 1ns / 1ps\n\n";
+
+    print $fh get_verilog_full_adder();
+    print $fh get_verilog_rca();
+    print $fh get_verilog_mux_wide();
+    print $fh get_verilog_csla_block();
+    print $fh get_verilog_hybrid_adder($n_bits, $k_bits, $msb_bits, $module_name);
+    
+    close($fh);
+
+    my ($filename, $dirs, $suffix) = fileparse($out_file, qr/\.v/);
+    my $tb_file = $dirs . $filename . "_tb.v";
+    
+    print "Generating testbench in file '$tb_file'...\n";
+    open(my $tb_fh, '>', $tb_file) or die "Could not open file '$tb_file': $!";
+    
+    print $tb_fh get_verilog_testbench($n_bits, $k_bits, $module_name);
+    
+    close($tb_fh);
+}
+
+sub get_verilog_full_adder {
+    return <<'__VERILOG_FA__';
+module full_adder (
+    input  a,
+    input  b,
+    input  cin,
+    output sum,
+    output cout
+);
+    wire p, g;
+    assign p   = a ^ b;
+    assign sum = p ^ cin;
+    assign g    = a & b;
+    assign cout = g | (p & cin);
+endmodule
+__VERILOG_FA__
+}
+
+sub get_verilog_rca {
+    return <<'__VERILOG_RCA__';
+
+module rca (a, b, cin, sum, cout);
+    parameter WIDTH = 4;
+    
+    input  [WIDTH-1:0] a;
+    input  [WIDTH-1:0] b;
+    input              cin;
+    output [WIDTH-1:0] sum;
+    output             cout;
+    
+    wire [WIDTH:0] carry_wire;
+    assign carry_wire[0] = cin;
+    
+    genvar i;
+    generate
+        for (i = 0; i < WIDTH; i = i + 1) begin : rca_stage
+            full_adder fa_inst (
+                .a    (a[i]),
+                .b    (b[i]),
+                .cin  (carry_wire[i]),
+                .sum  (sum[i]),
+                .cout (carry_wire[i+1])
+            );
+        end
+    endgenerate
+    
+    assign cout = carry_wire[WIDTH];
+endmodule
+__VERILOG_RCA__
+}
+
+sub get_verilog_mux_wide {
+    return <<'__VERILOG_MUX__';
+
+module mux_2to1_wide (d0, d1, sel, y);
+    parameter WIDTH = 4;
+    
+    input  [WIDTH-1:0] d0;
+    input  [WIDTH-1:0] d1;
+    input              sel;
+    output [WIDTH-1:0] y;
+    
+    genvar i;
+    generate
+        for (i = ind 0; i < WIDTH; i = i + 1) begin : mux_bit
+            wire n_sel, y0, y1;
+            not u_not (n_sel, sel);
+            and u_and0 (y0, d0[i], n_sel);
+            and u_and1 (y1, d1[i], sel);
+            or  u_or (y[i], y0, y1);
+        end
+    endgenerate
+endmodule
+__VERILOG_MUX__
+}
+
+sub get_verilog_csla_block {
+    return <<'__VERILOG_CSLA__';
+
+module csla_block (a, b, cin, sum, cout);
+    parameter WIDTH = 4;
+    
+    input  [WIDTH-1:0] a;
+    input  [WIDTH-1:0] b;
+    input              cin;
+    output [WIDTH-1:0] sum;
+    output             cout;
+    
+    wire [WIDTH-1:0] sum_0, sum_1;
+    wire             cout_0, cout_1;
+    
+    rca #(.WIDTH(WIDTH)) rca_0 (
+        .a    (a),
+        .b    (b),
+        .cin  (1'b0),
+        .sum  (sum_0),
+        .cout (cout_0)
+    );
+    
+    rca #(.WIDTH(WIDTH)) rca_1 (
+        .a    (a),
+        .b    (b),
+        .cin  (1'b1),
+        .sum  (sum_1),
+        .cout (cout_1)
+    );
+    
+    mux_2to1_wide #(.WIDTH(WIDTH)) sum_mux (
+        .d0   (sum_0),
+        .d1   (sum_1),
+        .sel  (cin),
+        .y    (sum)
+    );
+    
+    assign cout = (cin == 1'b0) ? cout_0 : cout_1;
+    
+endmodule
+__VERILOG_CSLA__
+}
+
+sub get_verilog_hybrid_adder {
+    my ($n, $k, $msb_w, $name) = @_;
+
+    my $verilog_string = <<"__VERILOG_HYBRID__";
+
+module $name (a, b, cin, sum, cout);
+    parameter N = $n;
+    parameter K = $k;
+    
+    input  [N-1:0] a;
+    input  [N-1:0] b;
+    input          cin;
+    output [N-1:0] sum;
+    output         cout;
+
+    localparam MSB_WIDTH = N - K;
+    
+    wire lsb_cout;
+
+    csla_block #(.WIDTH(K)) lsb_csla_inst (
+        .a    (a[K-1:0]),
+        .b    (b[K-1:0]),
+        .cin  (cin),
+        .sum  (sum[K-1:0]),
+        .cout (lsb_cout)
+    );
+
+    rca #(.WIDTH(MSB_WIDTH)) msb_rca_inst (
+        .a    (a[N-1:K]),
+        .b    (b[N-1:K]),
+        .cin  (lsb_cout), 
+        .sum  (sum[N-1:K]),
+        .cout (cout)
+    );
+
+endmodule
+__VERILOG_HYBRID__
+
+    return $verilog_string;
+}
+
+sub get_verilog_testbench {
+    my ($n, $k, $module_name) = @_;
+    
+    my $tb_string = <<"__VERILOG_TB__";
+`timescale 1ns / 1ps
+
+module ${module_name}_tb;
+
+    localparam N = $n;
+    localparam K = $k;
+    localparam NUM_TESTS = 500; 
+
+    reg  [N-1:0] a;
+    reg  [N-1:0] b;
+    reg          cin;
+    wire [N-1:0] sum;
+    wire         cout;
+
+    wire [N:0] expected_sum;
+    assign expected_sum = {1'b0, a} + {1'b0, b} + {N{1'b0}, cin};
+
+    wire error;
+    assign error = (expected_sum != {cout, sum});
+
+    integer i, j, error_count; 
+
+    $module_name #(
+        .N(N),
+        .K(K)
+    ) DUT (
+        .a    (a),
+        .b    (b),
+        .cin  (cin),
+        .sum  (sum),
+        .cout (cout)
+    );
+
+    initial begin
+        \$display("--- Starting Testbench for $module_name (N=%0d, K=%0d) ---", N, K);
+        error_count = 0;
+        
+        if (N > 64) begin
+            \$display("--- Info: N > 64, randomizing in a loop. ---");
+        end
+
+        for (i = 0; i < NUM_TESTS; i = i + 1) begin
+            if (N <= 64) begin
+                a   = {\$random, \$random}; 
+                b   = {\$random, \$random};
+            end else begin
+                for (j = 0; j < N; j = j + 1) begin
+                    a[j] = \$random % 2;
+                    b[j] = \$random % 2;
+                end
+            end
+            cin = \$random % 2;
+
+            #10; 
+
+            if (error) begin
+                \$display("!!! ERROR @ time %0t !!!", \$time);
+                \$display("    Inputs:  a=%h, b=%h, cin=%b", a, b, cin);
+                \$display("    DUT:     {cout,sum} = %h", {cout, sum});
+                \$display("    Expected: {cout,sum} = %s", expected_sum);
+                error_count = error_count + 1;
+                if (error_count > 10) begin
+                    \$display("!!! Too many errors. Aborting test. !!!");
+                    \$finish;
+                end
+            end
+        end
+
+        if (error_count == 0) begin
+            \$display("--- TEST PASSED: All %0d random tests successful! ---", NUM_TESTS);
+        end else begin
+            \$display("--- TEST FAILED: %0d errors found out of %0d tests. ---", error_count, NUM_TESTS);
+        }
+        \$finish;
+    end
+
+endmodule
+__VERILOG_TB__
+
+    return $tb_string;
+}
+
+main();
