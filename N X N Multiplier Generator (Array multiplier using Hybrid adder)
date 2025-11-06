@@ -1,1 +1,462 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use POSIX 'floor';
 
+# --- Get User Input (Interactive) ---
+print "Enter N (default: 8): ";
+my $N = <STDIN>;
+chomp($N);
+$N = $N || 8; # Use 8 if input is empty
+
+my $K_default = floor($N / 2);
+print "Enter K (default: $K_default): ";
+my $K = <STDIN>;
+chomp($K);
+$K = $K || $K_default; # Use calculated default if empty
+
+print "--- Generating with N=$N, K=$K ---\n";
+# ------------------------------------
+
+my $MSB_N = $N - $K;
+
+if ($MSB_N <= 0) {
+    die "Error: K ($K) must be less than N ($N). Please choose a smaller K.\n";
+}
+
+my $output_file = "hybrid_multiplier_N${N}_K${K}.v";
+open(my $fh, '>', $output_file) or die "Could not open file '$output_file' $!";
+
+# This hash keeps track of modules already generated to avoid duplicates
+my %generated_modules;
+
+# Start writing the Verilog file
+print $fh "`timescale 1ns / 1ps\n\n";
+
+# Generate the top-level multiplier and all its dependencies
+gen_array_multiplier($fh, $N, $K);
+
+# Generate the testbench
+gen_testbench($fh, $N, $K);
+
+close($fh);
+
+print "Successfully generated Verilog file: '$output_file'\n";
+print "Parameters: N=$N, K=$K (for hybrid adder)\n";
+
+
+# --- Subroutines to Generate Verilog Modules ---
+
+sub gen_full_adder {
+    my ($fh) = @_;
+    return if $generated_modules{'full_adder'}++; # Generate only once
+
+    print $fh <<"EOF";
+// Module: full_adder
+// Description: Basic 1-bit full adder
+module full_adder (
+    input  wire a,
+    input  wire b,
+    input  wire cin,
+    output wire sum,
+    output wire cout
+);
+    assign sum  = a ^ b ^ cin;
+    assign cout = (a & b) | (b & cin) | (a & cin);
+endmodule
+
+EOF
+}
+
+sub gen_rca {
+    my ($fh, $width) = @_;
+    my $mod_name = "rca_${width}";
+    return if $generated_modules{$mod_name}++;
+
+    gen_full_adder($fh); # Dependency
+
+    print $fh <<"EOF";
+// Module: rca_${width}
+// Description: $width-bit Ripple Carry Adder
+module $mod_name (
+    input  wire [${width}-1:0] a,
+    input  wire [${width}-1:0] b,
+    input  wire              cin,
+    output wire [${width}-1:0] sum,
+    output wire              cout
+);
+    wire [${width}:0] c;
+    assign c[0] = cin;
+
+    genvar i;
+    generate
+        for (i = 0; i < $width; i = i + 1) begin : rca_stage
+            full_adder fa_inst (
+                .a(a[i]),
+                .b(b[i]),
+                .cin(c[i]),
+                .sum(sum[i]),
+                .cout(c[i+1])
+            );
+        end
+    endgenerate
+
+    assign cout = c[$width];
+endmodule
+
+EOF
+}
+
+sub gen_mux {
+    my ($fh, $width) = @_;
+    my $mod_name = "mux_2to1_width${width}";
+    return if $generated_modules{$mod_name}++;
+
+    print $fh <<"EOF";
+// Module: mux_2to1_width${width}
+// Description: $width-bit 2-to-1 Multiplexer
+module $mod_name (
+    input  wire [${width}-1:0] d0,
+    input  wire [${width}-1:0] d1,
+    input  wire              sel,
+    output wire [${width}-1:0] y
+);
+    assign y = sel ? d1 : d0;
+endmodule
+
+EOF
+}
+
+sub gen_csla {
+    my ($fh, $width) = @_;
+    my $mod_name = "csla_${width}";
+    return if $generated_modules{$mod_name}++;
+
+    my $rca_mod = "rca_${width}";
+    my $mux_sum_mod = "mux_2to1_width${width}";
+    my $mux_cout_mod = "mux_2to1_width1";
+
+    # Dependencies
+    gen_rca($fh, $width);
+    gen_mux($fh, $width);
+    gen_mux($fh, 1);
+
+    print $fh <<"EOF";
+// Module: csla_${width}
+// Description: $width-bit Carry-Select Adder
+module $mod_name (
+    input  wire [${width}-1:0] a,
+    input  wire [${width}-1:0] b,
+    input  wire              cin,
+    output wire [${width}-1:0] sum,
+    output wire              cout
+);
+    wire [${width}-1:0] sum0, sum1;
+    wire              cout0, cout1;
+
+    // RCA for cin=0
+    $rca_mod rca0 (
+        .a(a), .b(b), .cin(1'b0),
+        .sum(sum0), .cout(cout0)
+    );
+
+    // RCA for cin=1
+    $rca_mod rca1 (
+        .a(a), .b(b), .cin(1'b1),
+        .sum(sum1), .cout(cout1)
+    );
+
+    // Mux for Sum
+    $mux_sum_mod mux_sum (
+        .d0(sum0), .d1(sum1), .sel(cin), .y(sum)
+    );
+
+    // Mux for Cout
+    $mux_cout_mod mux_cout (
+        .d0(cout0), .d1(cout1), .sel(cin), .y(cout)
+    );
+endmodule
+
+EOF
+}
+
+sub gen_hybrid_adder {
+    my ($fh, $n, $k) = @_;
+    my $mod_name = "hybrid_adder_${n}_${k}";
+    return if $generated_modules{$mod_name}++;
+
+    my $msb_n_local = $n - $k;
+    my $rca_mod = "rca_${k}";
+    my $csla_mod = "csla_${msb_n_local}";
+
+    # Dependencies
+    gen_rca($fh, $k);
+    gen_csla($fh, $msb_n_local);
+
+    print $fh <<"EOF";
+// Module: hybrid_adder_${n}_${k}
+// Description: Level I $n-bit Hybrid Adder (K=$k)
+//              LSB ($k bits) = RCA
+//              MSB (${msb_n_local} bits) = CSLA
+module $mod_name (
+    input  wire [${n}-1:0] a,
+    input  wire [${n}-1:0] b,
+    input  wire              cin,
+    output wire [${n}-1:0] sum,
+    output wire              cout
+);
+    wire lsb_cout;
+
+    // LSB block (RCA)
+    $rca_mod lsb_adder (
+        .a(a[${k}-1:0]),
+        .b(b[${k}-1:0]),
+        .cin(cin),
+        .sum(sum[${k}-1:0]),
+        .cout(lsb_cout)
+    );
+
+    // MSB block (CSLA)
+    $csla_mod msb_adder (
+        .a(a[${n}-1:$k]),
+        .b(b[${n}-1:$k]),
+        .cin(lsb_cout),
+        .sum(sum[${n}-1:$k]),
+        .cout(cout)
+    );
+endmodule
+
+EOF
+}
+
+#
+# *** MODIFIED SUBROUTINE (v2) ***
+#
+sub gen_array_multiplier {
+    my ($fh, $n, $k) = @_;
+    my $mod_name = "array_multiplier_${n}";
+    return if $generated_modules{$mod_name}++;
+
+    my $hybrid_adder_mod = "hybrid_adder_${n}_${k}";
+    my $p_width = 2 * $n;
+
+    # Dependencies
+    gen_full_adder($fh);
+    gen_hybrid_adder($fh, $n, $k); # The final stage adder
+
+    print $fh <<"EOF";
+// Module: array_multiplier_${n} (Corrected Logic v2)
+// Description: Level II $n-bit Array Multiplier
+//              Uses $hybrid_adder_mod for final stage addition
+module $mod_name (
+    input  wire [${n}-1:0] a,
+    input  wire [${n}-1:0] b,
+    output wire [${p_width}-1:0] p
+);
+
+    // 1. Partial Product Generation
+    wire [${n}-1:0] pp [${n}-1:0]; // pp[row][col]
+    genvar i, j;
+    generate
+        for (i = 0; i < $n; i = i + 1) begin : pp_gen_row
+            for (j = 0; j < $n; j = j + 1) begin : pp_gen_col
+                assign pp[i][j] = a[j] & b[i];
+            end
+        end
+    endgenerate
+
+    // 2. Carry-Save Adder Array
+    wire [${n}-1:0] s [${n}-1:0]; // Sum wires
+    wire [${n}-1:0] c [${n}-1:0]; // Carry wires
+
+    // First row (Row 0) is special:
+    assign p[0] = pp[0][0];
+
+    for (j = 0; j < ${n}-1; j = j+1) begin : row_0_fa
+        full_adder fa (
+            .a(pp[0][j+1]),
+            .b(pp[1][j]),
+            .cin(1'b0),
+            .sum(s[0][j]),
+            .cout(c[0][j])
+        );
+    end
+    full_adder fa_row0_last (
+        .a(1'b0),
+        .b(pp[1][${n}-1]),
+        .cin(1'b0),
+        .sum(s[0][${n}-1]),
+        .cout(c[0][${n}-1])
+    );
+
+
+    // Generate the main CSA array (Rows 1 to N-2)
+    generate
+        # Handle N=2 edge case
+        if ($n == 2) begin
+             assign p[1] = s[0][0];
+        end
+        
+        # Loop runs from i=1 up to i=n-2
+        for (i = 1; i < ${n}-1; i = i + 1) begin : csa_row
+            
+            # This assigns p[1] through p[n-2]
+            assign p[i] = s[i-1][0];
+
+            for (j = 0; j < ${n}-1; j = j + 1) begin : row_fa
+                full_adder fa (
+                    .a(pp[i+1][j]),     # Next partial product
+                    .b(s[i-1][j+1]),   # Sum from row above (shifted)
+                    .cin(c[i-1][j]),   # Carry from row above
+                    .sum(s[i][j]),     # Sum for this row
+                    .cout(c[i][j])     # Carry for this row
+                );
+            end
+
+            # Last FA in the row
+            full_adder fa_last (
+                .a(pp[i+1][${n}-1]),
+                .b(1'b0),
+                .cin(c[i-1][${n}-1]),
+                .sum(s[i][${n}-1]),
+                .cout(c[i][${n}-1])
+            );
+        end
+    endgenerate
+
+    # 3. Final Stage: Use Hybrid Adder
+    # The final two vectors to add are s[n-2] and c[n-2]
+    
+    # Vector 'a' for the adder is the final sum vector s[n-2]
+    wire [${n}-1:0] final_s = s[${n}-2];
+    
+    # Vector 'b' for the adder is the final carry vector c[n-2], shifted left 1
+    wire [${n}-1:0] final_c_shifted = {c[${n}-2][${n}-2:0], 1'b0};
+
+    wire [${n}-1:0] adder_sum;
+    wire              adder_cout;
+
+    $hybrid_adder_mod final_stage_adder (
+        .a(final_s),
+        .b(final_c_shifted),
+        .cin(1'b0),
+        .sum(adder_sum),
+        .cout(adder_cout)
+    );
+
+    # 4. Combine final adder result with the LSBs
+    
+    # p[n-1] is the LSB of the final N-bit addition
+    assign p[${n}-1] = adder_sum[0];
+    
+    # p[2n-1 : n] are the remaining N bits from the adder
+    assign p[${p_width}-1:$n] = {adder_cout, adder_sum[${n}-1:1]};
+
+endmodule
+
+EOF
+}
+
+
+sub gen_testbench {
+    my ($fh, $n, $k) = @_;
+    my $p_width = 2 * $n;
+    my $mult_mod = "array_multiplier_${n}";
+
+    # Calculate hex width for display
+    my $n_hex_chars = ceil($n / 4);
+    my $p_hex_chars = ceil($p_width / 4);
+
+    print $fh <<"EOF";
+// Module: tb_multiplier
+// Description: Self-checking testbench for the $mult_mod
+module tb_multiplier;
+
+    localparam N = $n;
+    localparam K_ADDER = $k;
+    localparam P_WIDTH = $p_width;
+    localparam NUM_TESTS = 200;
+
+    reg  [N-1:0] a_tb;
+    reg  [N-1:0] b_tb;
+    wire [P_WIDTH-1:0] p_dut;
+    wire [P_WIDTH-1:0] p_expected;
+
+    integer i;
+    integer error_count = 0;
+
+    // Instantiate the Device Under Test (DUT)
+    $mult_mod dut (
+        .a(a_tb),
+        .b(b_tb),
+        .p(p_dut)
+    );
+
+    // Behavioral model for verification (the "golden" reference)
+    assign p_expected = a_tb * b_tb;
+
+    // Test Vector Generation
+    initial begin
+        \$display("--- Starting Multiplier Testbench ---");
+        \$display("N = %0d, K_Adder = %0d, P_WIDTH = %0d", N, K_ADDER, P_WIDTH);
+
+        // Test 1: Zero test
+        a_tb = 0; b_tb = 0; #10;
+        check_result();
+
+        // Test 2: Max value test
+        a_tb = {N{1'b1}}; b_tb = {N{1'b1}}; #10;
+        check_result();
+
+        // Test 3: Max * One
+        a_tb = {N{1'b1}}; b_tb = 1; #10;
+        check_result();
+
+        // Test 4: One * Max
+        a_tb = 1; b_tb = {N{1'b1}}; #10;
+        check_result();
+
+        // Test 5: Random vectors
+        \$display("--- Running %0d random tests... ---", NUM_TESTS);
+        for (i = 0; i < NUM_TESTS; i = i + 1) begin
+            a_tb = \$random;
+            b_tb = \$random;
+            #10;
+            check_result();
+        end
+
+        // Final Report
+        if (error_count == 0) begin
+            \$display("\\n*** SUCCESS: All random tests passed! ***");
+        end else begin
+            \$display("\\n*** FAILURE: %0d error(s) found. ***", error_count);
+        end
+
+        \$finish;
+    end
+
+    // Verification Task
+    task check_result;
+        if (p_dut !== p_expected) begin
+            // Use %0h to pad hex values for easier reading
+            \$display("ERROR @ %0t ns: a=%0${n_hex_chars}h, b=%0${n_hex_chars}h", \$time, a_tb, b_tb);
+            \$display("  Expected: %0${p_hex_chars}h", p_expected);
+            \$display("  Got (DUT):  %0${p_hex_chars}h", p_dut);
+            error_count = error_count + 1;
+        end
+    endtask
+
+    // Optional: Monitor for debugging
+    initial begin
+        \$monitor("Time=%0t ns | a=%0${n_hex_chars}h, b=%0${n_hex_chars}h | p_dut=%0${p_hex_chars}h", \$time, a_tb, b_tb, p_dut);
+    end
+
+endmodule
+EOF
+}
+
+# Need ceil function for hex width calculation
+sub ceil {
+    my ($x) = @_;
+    return int($x) + ($x > int($x));
+}
