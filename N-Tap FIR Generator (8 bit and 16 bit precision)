@@ -1,1 +1,699 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use POSIX 'floor';
+use File::Spec;
 
+# --- Get User Input (Interactive) ---
+print "Enter precision (P) (This is 'N' for the base adders/multipliers, default: 8): ";
+my $precision = <STDIN>;
+chomp($precision);
+$precision = $precision || 8; # Use 8 if input is empty
+
+# Validate precision (allow 8 or 16 as per original prompt)
+if ($precision != 8 && $precision != 16) {
+    print "Warning: Standard precision is 8 or 16. Using $precision.\n";
+}
+if ($precision <= 0) {
+    die "Error: Precision must be a positive number.\n";
+}
+
+
+# NEW: Ask for K for the base hybrid adder (used in multiplier)
+my $K_default = floor($precision / 2);
+print "Enter K for base hybrid adder (default: $K_default): ";
+my $K_adder = <STDIN>;
+chomp($K_adder);
+$K_adder = $K_adder || $K_default; # Use calculated default if empty
+
+# Validate K
+if ($K_adder <= 0 || $K_adder >= $precision) {
+    die "Error: K ($K_adder) must be a positive number and less than P ($precision). Please choose a valid K.\n";
+}
+
+print "Enter number of taps (T) (default: 4): ";
+my $num_taps = <STDIN>;
+chomp($num_taps);
+$num_taps = $num_taps || 4; # Use 4 if input is empty
+if ($num_taps <= 0) {
+    die "Error: Taps must be a positive number.\n";
+}
+
+
+print "Enter coefficient file name (default: coeffs.hex): ";
+my $coeff_file = <STDIN>;
+chomp($coeff_file);
+$coeff_file = $coeff_file || "coeffs.hex";
+# ------------------------------------
+
+print "--- Generating Level III FIR Filter ---\n";
+print "Precision (P/N):  $precision bits\n";
+print "Base Adder K:     $K_adder\n";
+print "Taps (T):         $num_taps\n";
+print "Coeff File:       $coeff_file\n";
+print "---------------------------------------\n";
+
+# --- Generate Coefficient File ---
+open(my $cfh, '>', $coeff_file) or die "Could not open file '$coeff_file' $!";
+print "Generating coefficient file '$coeff_file'...\n";
+for (my $i = 0; $i < $num_taps; $i++) {
+    # Generate a random coefficient
+    my $coeff = int(rand(2**$precision));
+    # Print as hex
+    printf $cfh "%x\n", $coeff;
+}
+close($cfh);
+# ------------------------------------
+
+my $output_file = "fir_filter_P${precision}_K${K_adder}_T${num_taps}.v";
+open(my $fh, '>', $output_file) or die "Could not open file '$output_file' $!";
+
+# This hash keeps track of modules already generated to avoid duplicates
+my %generated_modules;
+
+# Start writing the Verilog file
+print $fh "`timescale 1ns / 1ps\n\n";
+
+# Generate the top-level FIR filter and all its dependencies
+gen_fir_filter($fh, $precision, $num_taps, $K_adder, $coeff_file);
+
+# Generate the testbench for the FIR filter
+gen_fir_testbench($fh, $precision, $num_taps, $coeff_file);
+
+close($fh);
+
+print "Successfully generated Verilog file: '$output_file'\n";
+
+
+# --- Subroutines to Generate Verilog Modules ---
+
+sub gen_full_adder {
+    my ($fh) = @_;
+    return if $generated_modules{'full_adder'}++; # Generate only once
+
+    print $fh <<"EOF";
+// Module: full_adder
+// Description: Basic 1-bit full adder
+module full_adder (
+    input  wire a,
+    input  wire b,
+    input  wire cin,
+    output wire sum,
+    output wire cout
+);
+    assign sum  = a ^ b ^ cin;
+    assign cout = (a & b) | (b & cin) | (a & cin);
+endmodule
+
+EOF
+}
+
+sub gen_rca {
+    my ($fh, $width) = @_;
+    my $mod_name = "rca_${width}";
+    return if $generated_modules{$mod_name}++;
+
+    gen_full_adder($fh); # Dependency
+
+    print $fh <<"EOF";
+// Module: rca_${width}
+// Description: $width-bit Ripple Carry Adder
+module $mod_name (
+    input  wire [${width}-1:0] a,
+    input  wire [${width}-1:0] b,
+    input  wire              cin,
+    output wire [${width}-1:0] sum,
+    output wire              cout
+);
+    wire [${width}:0] c;
+    assign c[0] = cin;
+
+    genvar i;
+    generate
+        for (i = 0; i < $width; i = i + 1) begin : rca_stage
+            full_adder fa_inst (
+                .a(a[i]),
+                .b(b[i]),
+                .cin(c[i]),
+                .sum(sum[i]),
+                .cout(c[i+1])
+            );
+        end
+    endgenerate
+
+    assign cout = c[$width];
+endmodule
+
+EOF
+}
+
+sub gen_mux {
+    my ($fh, $width) = @_;
+    my $mod_name = "mux_2to1_width${width}";
+    return if $generated_modules{$mod_name}++;
+
+    print $fh <<"EOF";
+// Module: mux_2to1_width${width}
+// Description: $width-bit 2-to-1 Multiplexer
+module $mod_name (
+    input  wire [${width}-1:0] d0,
+    input  wire [${width}-1:0] d1,
+    input  wire              sel,
+    output wire [${width}-1:0] y
+);
+    assign y = sel ? d1 : d0;
+endmodule
+
+EOF
+}
+
+sub gen_csla {
+    my ($fh, $width) = @_;
+    my $mod_name = "csla_${width}";
+    return if $generated_modules{$mod_name}++;
+
+    my $rca_mod = "rca_${width}";
+    my $mux_sum_mod = "mux_2to1_width${width}";
+    my $mux_cout_mod = "mux_2to1_width1";
+
+    # Dependencies
+    gen_rca($fh, $width);
+    gen_mux($fh, $width);
+    gen_mux($fh, 1);
+
+    print $fh <<"EOF";
+// Module: csla_${width}
+// Description: $width-bit Carry-Select Adder
+module $mod_name (
+    input  wire [${width}-1:0] a,
+    input  wire [${width}-1:0] b,
+    input  wire              cin,
+    output wire [${width}-1:0] sum,
+    output wire              cout
+);
+    wire [${width}-1:0] sum0, sum1;
+    wire              cout0, cout1;
+
+    // RCA for cin=0
+    $rca_mod rca0 (
+        .a(a), .b(b), .cin(1'b0),
+        .sum(sum0), .cout(cout0)
+    );
+
+    // RCA for cin=1
+    $rca_mod rca1 (
+        .a(a), .b(b), .cin(1'b1),
+        .sum(sum1), .cout(cout1)
+    );
+
+    // Mux for Sum
+    $mux_sum_mod mux_sum (
+        .d0(sum0), .d1(sum1), .sel(cin), .y(sum)
+    );
+
+    // Mux for Cout
+    $mux_cout_mod mux_cout (
+        .d0(cout0), .d1(cout1), .sel(cin), .y(cout)
+    );
+endmodule
+
+EOF
+}
+
+sub gen_hybrid_adder {
+    my ($fh, $n, $k) = @_;
+    my $mod_name = "hybrid_adder_${n}_${k}";
+    return if $generated_modules{$mod_name}++;
+
+    my $msb_n_local = $n - $k;
+    # Handle edge case where K might be >= N for small N
+    if ($msb_n_local <= 0) {
+        warn "Warning: K($k) >= N($n) for hybrid_adder. Generating a simple RCA_${n} instead.\n";
+        gen_rca($fh, $n); # Just generate the RCA as a dependency
+        # Create a wrapper module
+        print $fh <<"EOF";
+// Module: hybrid_adder_${n}_${k} (Wrapper for RCA_${n})
+// Description: K($k) >= N($n), defaulting to simple RCA.
+module $mod_name (
+    input  wire [${n}-1:0] a,
+    input  wire [${n}-1:0] b,
+    input  wire              cin,
+    output wire [${n}-1:0] sum,
+    output wire              cout
+);
+    rca_${n} rca_wrapper (
+        .a(a), .b(b), .cin(cin), .sum(sum), .cout(cout)
+    );
+endmodule
+EOF
+        return; # Stop here for this case
+    }
+    
+    my $rca_mod = "rca_${k}";
+    my $csla_mod = "csla_${msb_n_local}";
+
+    # Dependencies
+    gen_rca($fh, $k);
+    gen_csla($fh, $msb_n_local);
+
+    print $fh <<"EOF";
+// Module: hybrid_adder_${n}_${k}
+// Description: Level I $n-bit Hybrid Adder (K=$k)
+//              LSB ($k bits) = RCA
+//              MSB (${msb_n_local} bits) = CSLA
+module $mod_name (
+    input  wire [${n}-1:0] a,
+    input  wire [${n}-1:0] b,
+    input  wire              cin,
+    output wire [${n}-1:0] sum,
+    output wire              cout
+);
+    wire lsb_cout;
+
+    // LSB block (RCA)
+    $rca_mod lsb_adder (
+        .a(a[${k}-1:0]),
+        .b(b[${k}-1:0]),
+        .cin(cin),
+        .sum(sum[${k}-1:0]),
+        .cout(lsb_cout)
+    );
+
+    // MSB block (CSLA)
+    $csla_mod msb_adder (
+        .a(a[${n}-1:$k]),
+        .b(b[${n}-1:$k]),
+        .cin(lsb_cout),
+        .sum(sum[${n}-1:$k]),
+        .cout(cout)
+    );
+endmodule
+
+EOF
+}
+
+sub gen_array_multiplier {
+    my ($fh, $n, $k) = @_;
+    my $mod_name = "array_multiplier_${n}";
+    return if $generated_modules{$mod_name}++;
+
+    my $hybrid_adder_mod = "hybrid_adder_${n}_${k}";
+    my $p_width = 2 * $n;
+
+    # Dependencies
+    gen_full_adder($fh);
+    gen_hybrid_adder($fh, $n, $k); # The final stage adder
+
+    print $fh <<"EOF";
+// Module: array_multiplier_${n}
+// Description: Level II $n-bit Array Multiplier
+//              Uses $hybrid_adder_mod for final stage addition
+module $mod_name (
+    input  wire [${n}-1:0] a,
+    input  wire [${n}-1:0] b,
+    output wire [${p_width}-1:0] p
+);
+
+    // 1. Partial Product Generation
+    wire [${n}-1:0] pp [${n}-1:0]; // pp[row][col]
+    genvar i, j;
+    generate
+        for (i = 0; i < $n; i = i + 1) begin : pp_gen_row
+            for (j = 0; j < $n; j = j + 1) begin : pp_gen_col
+                assign pp[i][j] = a[j] & b[i];
+            end
+        end
+    endgenerate
+
+    // 2. Carry-Save Adder Array
+    wire [${n}-1:0] s [${n}-1:0]; // Sum wires
+    wire [${n}-1:0] c [${n}-1:0]; // Carry wires
+
+    // First row (Row 0) is special:
+    assign p[0] = pp[0][0];
+
+    for (j = 0; j < ${n}-1; j = j+1) begin : row_0_fa
+        full_adder fa (
+            .a(pp[0][j+1]),
+            .b(pp[1][j]),
+            .cin(1'b0),
+            .sum(s[0][j]),
+            .cout(c[0][j])
+        );
+    end
+    full_adder fa_row0_last (
+        .a(1'b0),
+        .b(pp[1][${n}-1]),
+        .cin(1'b0),
+        .sum(s[0][${n}-1]),
+        .cout(c[0][${n}-1])
+    );
+
+
+    // Generate the main CSA array (Rows 1 to N-2)
+    generate
+        # Handle N=2 edge case
+        if ($n == 2) begin
+             assign p[1] = s[0][0];
+        end
+        
+        # Loop runs from i=1 up to i=n-2
+        for (i = 1; i < ${n}-1; i = i + 1) begin : csa_row
+            
+            # This assigns p[1] through p[n-2]
+            assign p[i] = s[i-1][0];
+
+            for (j = 0; j < ${n}-1; j = j + 1) begin : row_fa
+                full_adder fa (
+                    .a(pp[i+1][j]),     # Next partial product
+                    .b(s[i-1][j+1]),   # Sum from row above (shifted)
+                    .cin(c[i-1][j]),   # Carry from row above
+                    .sum(s[i][j]),     # Sum for this row
+                    .cout(c[i][j])     # Carry for this row
+                );
+            end
+
+            # Last FA in the row
+            full_adder fa_last (
+                .a(pp[i+1][${n}-1]),
+                .b(1'b0),
+                .cin(c[i-1][${n}-1]),
+                .sum(s[i][${n}-1]),
+                .cout(c[i][${n}-1])
+            );
+        end
+    endgenerate
+
+    # 3. Final Stage: Use Hybrid Adder
+    # The final two vectors to add are s[n-2] and c[n-2]
+    
+    # Vector 'a' for the adder is the final sum vector s[n-2]
+    wire [${n}-1:0] final_s = s[${n}-2];
+    
+    # Vector 'b' for the adder is the final carry vector c[n-2], shifted left 1
+    wire [${n}-1:0] final_c_shifted = {c[${n}-2][${n}-2:0], 1'b0};
+
+    wire [${n}-1:0] adder_sum;
+    wire              adder_cout;
+
+    $hybrid_adder_mod final_stage_adder (
+        .a(final_s),
+        .b(final_c_shifted),
+        .cin(1'b0),
+        .sum(adder_sum),
+        .cout(adder_cout)
+    );
+
+    # 4. Combine final adder result with the LSBs
+    
+    # p[n-1] is the LSB of the final N-bit addition
+    assign p[${n}-1] = adder_sum[0];
+    
+    # p[2n-1 : n] are the remaining N bits from the adder
+    assign p[${p_width}-1:$n] = {adder_cout, adder_sum[${n}-1:1]};
+
+endmodule
+
+EOF
+}
+
+#
+# *** LEVEL III FIR FILTER ***
+#
+sub gen_fir_filter {
+    my ($fh, $p, $t, $k, $coeff_file) = @_;
+    # $p = precision (N)
+    # $t = num_taps
+    # $k = K for base adder (in multiplier)
+    # $coeff_file = path to coefficient file
+
+    my $mod_name = "fir_filter_P${p}_T${t}";
+    return if $generated_modules{$mod_name}++;
+    
+    # Calculate widths
+    my $prod_width = 2 * $p;
+    # Calculate accumulator width. Summing T products of $prod_width
+    # requires log2(T) extra bits.
+    my $log2_t = ($t == 1) ? 0 : ceil(log($t) / log(2));
+    my $acc_width = $prod_width + $log2_t;
+    
+    # K for the *accumulator's* hybrid adder
+    my $k_acc = floor($acc_width / 2);
+    
+    my $mult_mod = "array_multiplier_${p}";
+    my $adder_mod = "hybrid_adder_${acc_width}_${k_acc}";
+
+    # --- Dependencies ---
+    # 1. Generate the P-bit multiplier (Level II)
+    #    This will use the base P and K
+    gen_array_multiplier($fh, $p, $k);
+    
+    # 2. Generate the ACC_WIDTH-bit hybrid adder for the tree
+    #    This will use the wider ACC_WIDTH and its own K
+    gen_hybrid_adder($fh, $acc_width, $k_acc);
+    # ---
+
+    my $abs_coeff_path = File::Spec->rel2abs($coeff_file);
+    
+    print $fh <<"EOF";
+// Module: $mod_name
+// Description: Level III $t-tap FIR Filter (Precision $p-bit)
+//              Uses $mult_mod (with P=$p, K=$k) for multipliers
+//              Uses $adder_mod (with N=$acc_width, K=$k_acc) for adder tree
+module $mod_name (
+    input  wire              clk,
+    input  wire              rst_n,
+    input  wire [${p}-1:0]   x_in,  // Input sample
+    output wire [${acc_width}-1:0] y_out // Output sample
+);
+
+    localparam P = $p;
+    localparam T = $t;
+    localparam PROD_W = $prod_width;
+    localparam ACC_W = $acc_width;
+    localparam string COEFF_FILE = "$abs_coeff_path";
+
+    // 1. Tap-Delay Line
+    reg [P-1:0] taps [0:T-1];
+    
+    // 2. Coefficient Registers
+    reg [P-1:0] coeffs [0:T-1];
+
+    // 3. Multiplier Outputs
+    wire [PROD_W-1:0] prods [0:T-1];
+
+    // 4. Adder Tree Wires
+    wire [ACC_W-1:0] sums [0:T-2]; // Need T-1 adders for T products
+
+    // Load coefficients from file at startup
+    initial begin
+        \$readmemh(COEFF_FILE, coeffs);
+    end
+
+    // Tap-Delay Line Logic (Shift Register)
+    integer i;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (i = 0; i < T; i = i + 1) begin
+                taps[i] <= {P{1'b0}};
+            end
+        end else begin
+            taps[0] <= x_in;
+            for (i = 1; i < T; i = i + 1) begin
+                taps[i] <= taps[i-1];
+            end
+        end
+    end
+
+    // --- Generate Multiplier and Adder Tree ---
+    genvar g;
+    generate
+        // 1. Instantiate T multipliers
+        for (g = 0; g < T; g = g + 1) begin : mult_stage
+            $mult_mod mult_inst (
+                .a(taps[g]),
+                .b(coeffs[g]),
+                .p(prods[g])
+            );
+        end
+
+        // 2. Instantiate Adder Tree (as a combinational chain)
+        // We need to zero-extend the $prod_width products to $acc_width
+        localparam EXT_BITS = ACC_W - PROD_W;
+EOF
+    
+    # Handle the adder tree generation
+    if ($t == 1) {
+        # Edge case: 1 tap, no adders needed
+        print $fh "        assign y_out = {EXT_BITS'b0, prods[0]};\n";
+    } else {
+        # First adder in the chain
+        print $fh "        $adder_mod add_inst_0 (\n";
+        print $fh "            .a({EXT_BITS'b0, prods[0]}),\n";
+        print $fh "            .b({EXT_BITS'b0, prods[1]}),\n";
+        print $fh "            .cin(1'b0),\n";
+        print $fh "            .sum(sums[0]),\n";
+        print $fh "            .cout() // Unused\n";
+        print $fh "        );\n\n";
+
+        # Generate the rest of the adder chain
+        for (my $i = 1; $i < $t - 1; $i++) {
+            my $prod_idx = $i + 1;
+            my $sum_in_idx = $i - 1;
+            print $fh "        $adder_mod add_inst_${i} (\n";
+            print $fh "            .a(sums[${sum_in_idx}]),\n";
+            print $fh "            .b({EXT_BITS'b0, prods[${prod_idx}]}),\n";
+            print $fh "            .cin(1'b0),\n";
+            print $fh "            .sum(sums[${i}]),\n";
+            print $fh "            .cout() // Unused\n";
+            print $fh "        );\n\n";
+        }
+        
+        # Final output assignment
+        print $fh "        assign y_out = sums[T-2];\n";
+    }
+    
+    print $fh "    endgenerate\n";
+    print $fh "endmodule\n\n";
+}
+
+#
+# *** LEVEL III TESTBENCH ***
+#
+sub gen_fir_testbench {
+    my ($fh, $p, $t, $coeff_file) = @_;
+    
+    # Calculate widths again for the testbench
+    my $prod_width = 2 * $p;
+    my $log2_t = ($t == 1) ? 0 : ceil(log($t) / log(2));
+    my $acc_width = $prod_width + $log2_t;
+    my $abs_coeff_path = File::Spec->rel2abs($coeff_file);
+
+    # Calculate hex width for display
+    my $p_hex_chars = ceil($p / 4);
+    my $acc_hex_chars = ceil($acc_width / 4);
+
+    print $fh <<"EOF";
+// Module: tb_fir_filter
+// Description: Self-checking testbench for the $t-tap FIR filter
+module tb_fir_filter;
+
+    localparam P = $p;
+    localparam T = $t;
+    localparam ACC_W = $acc_width;
+    localparam string COEFF_FILE = "$abs_coeff_path";
+    localparam NUM_TESTS = 500;
+    localparam CLK_PERIOD = 10;
+
+    reg clk;
+    reg rst_n;
+    reg [P-1:0] x_in_tb;
+    
+    wire [ACC_W-1:0] y_out_dut;
+
+    integer i;
+    integer error_count = 0;
+
+    // Instantiate the Device Under Test (DUT)
+    fir_filter_P${p}_T${t} dut (
+        .clk(clk),
+        .rst_n(rst_n),
+        .x_in(x_in_tb),
+        .y_out(y_out_dut)
+    );
+
+    // --- Golden Model (Behavioral) ---
+    reg [P-1:0] taps_g [0:T-1];
+    reg [P-1:0] coeffs_g [0:T-1];
+    wire [ACC_W-1:0] y_out_expected;
+    reg signed [ACC_W-1:0] y_calc; // Use 'signed' for safety in accumulation
+
+    // Load coefficients into golden model
+    initial begin
+        \$readmemh(COEFF_FILE, coeffs_g);
+    end
+
+    // Golden model tap-delay line
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (i = 0; i < T; i = i + 1) begin
+                taps_g[i] <= {P{1'b0}};
+            end
+        end else begin
+            taps_g[0] <= x_in_tb;
+            for (i = 1; i < T; i = i + 1) begin
+                taps_g[i] <= taps_g[i-1];
+            end
+        end
+    end
+    
+    // Golden model behavioral calculation (combinational)
+    always @(*) begin
+        y_calc = 0;
+        for (i = 0; i < T; i = i + 1) begin
+            // Note: This assumes unsigned multiplication, matching the Level II multiplier
+            y_calc = y_calc + (taps_g[i] * coeffs_g[i]);
+        end
+    end
+    assign y_out_expected = y_calc;
+    // --- End Golden Model ---
+
+    // Clock Generator
+    initial begin
+        clk = 1'b0;
+        forever #(CLK_PERIOD / 2) clk = ~clk;
+    end
+
+    // Stimulus and Verification
+    initial begin
+        \$display("--- Starting FIR Filter Testbench ---");
+        \$display("P = %0d, T = %0d, ACC_W = %0d", P, T, ACC_W);
+        \$display("Coefficient file: %s", COEFF_FILE);
+
+        // 1. Reset the system
+        rst_n = 1'b0;
+        x_in_tb = {P{1'b0}};
+        #(CLK_PERIOD * 2);
+        rst_n = 1'b1;
+        \$display("Reset complete. Starting tests...");
+
+        // 2. Run random tests
+        for (i = 0; i < NUM_TESTS; i = i + 1) begin
+            x_in_tb = \$random;
+            @(posedge clk);
+            
+            // Give 1ns for combinational logic to settle
+            #1; 
+            
+            check_result();
+        end
+
+        // 3. Final Report
+        if (error_count == 0) begin
+            \$display("\\n*** SUCCESS: All %0d random tests passed! ***", NUM_TESTS);
+        end else begin
+            \$display("\\n*** FAILURE: %0d error(s) found. ***", error_count);
+        end
+        \$finish;
+    end
+
+    // Verification Task
+    task check_result;
+        if (y_out_dut !== y_out_expected) begin
+            \$display("ERROR @ %0t ns: Mismatch found!", \$time);
+            \$display("  Input (x_in): %0${p_hex_chars}h", x_in_tb);
+            \$display("  Expected (behavioral): %0${acc_hex_chars}h", y_out_expected);
+            \$display("  Got (DUT):             %0${acc_hex_chars}h", y_out_dut);
+            error_count = error_count + 1;
+        end
+    endtask
+
+endmodule
+EOF
+}
+
+# Need ceil function for hex width calculation
+sub ceil {
+    my ($x) = @_;
+    return int($x) + ($x > int($x));
+}
